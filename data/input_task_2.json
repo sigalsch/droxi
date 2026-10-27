@@ -1,0 +1,102 @@
+{
+    "tasks": [
+        {
+            "id": "task1",
+            "patient_id": "patient1",
+            "status": "Closed",
+            "assigned_to": "Primary",
+            "created_date": "2023-05-01T10:00:00Z",
+            "updated_date": "2023-05-01T10:00:00Z",
+            "message": "Patient needs medication refill",
+            "medications": [
+                {
+                    "code": "ACET001",
+                    "name": "Acetaminophen"
+                },
+                {
+                    "code": "IBU001",
+                    "name": "Ibuprofen"
+                }
+            ],
+            "pharmacy_id": 123
+        },
+        {
+            "id": "task2",
+            "patient_id": "patient2",
+            "status": "Closed",
+            "assigned_to": "Primary",
+            "created_date": "2023-05-02T14:30:00Z",
+            "updated_date": "2023-05-02T14:30:00Z",
+            "message": "Patient needs new prescription",
+            "medications": [
+                {
+                    "code": "ACET001",
+                    "name": "Acetaminophen"
+                },
+                {
+                    "code": "LISI001",
+                    "name": "Lisinopril"
+                }
+            ],
+            "pharmacy_id": 456
+        },
+        {
+            "id": "task4",
+            "patient_id": "patient1",
+            "status": "Closed",
+            "assigned_to": "Primary",
+            "created_date": "2023-05-04T11:45:00Z",
+            "updated_date": "2023-05-04T11:45:00Z",
+            "message": "Patient needs follow-up appointment",
+            "medications": [
+                {
+                    "code": "ACET001",
+                    "name": "Acetaminophen"
+                },
+                {
+                    "code": "LISI001",
+                    "name": "Lisinopril"
+                }
+            ],
+            "pharmacy_id": 123
+        },
+        {
+            "id": "task400",
+            "patient_id": "patient2",
+            "status": "Open",
+            "assigned_to": "Primary",
+            "created_date": "2023-05-09T14:30:00Z",
+            "updated_date": "2023-05-09T14:30:00Z",
+            "message": "The results of the patient's blood tests are in. Please review them ASAP.",
+            "medications": [
+                {
+                    "code": "ACET001",
+                    "name": "Acetaminophen"
+                },
+                {
+                    "code": "LISI001",
+                    "name": "Lisinopril"
+                }
+            ]
+        },
+        {
+            "id": "task3",
+            "patient_id": "patient3",
+            "status": "Open",
+            "assigned_to": "Primary",
+            "created_date": "2023-05-03T09:15:00Z",
+            "updated_date": "2023-05-04T09:15:00Z",
+            "message": "Patient needs medication adjustment",
+            "medications": [
+                {
+                    "code": "IBU001",
+                    "name": "Ibuprofen"
+                },
+                {
+                    "code": "METR001",
+                    "name": "Metronidazole"
+                }
+            ]
+        }
+    ]
+}
