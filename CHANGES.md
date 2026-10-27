@@ -19,6 +19,7 @@ groups. The change is in `DepartmentPatientRequestService`. The old `PerPatientR
 | [6. Trade-offs and production notes](#6-trade-offs-and-production-notes) | What a real DB would change, and known limits. |
 | [7. Tests](#7-tests) | The tests that were added. |
 | [8. Questions and observations](#8-questions-and-observations) | Answers to the `# Question` comments, and other issues found. |
+| [9. Future suggestions for production](#9-future-suggestions-for-production) | A more robust database, and observability tools. |
 
 ---
 
@@ -334,3 +335,50 @@ Run with `pytest` from the project root.
 - The DB path `tinydb/db.json` is relative to the working directory, and the tests write to the checked-in file.
   Tests should use `MemoryStorage` or a temporary file.
 - `__pycache__` directories and `tinydb/db.json` are committed, and should be in `.gitignore`.
+
+---
+
+## 9. Future suggestions for production
+
+TinyDB and stdlib `logging` fit the exercise. They are the limits listed in section 6, and a production deployment
+should replace them. None of this is implemented.
+
+### 9.1 A more robust database
+
+Use a real database, such as PostgreSQL or MongoDB (the choice does not change the design, the reconcile is the same).
+
+| Need | Today (TinyDB) | Production |
+|---|---|---|
+| Atomic update | Tasks, requests and events are written separately, so a failure leaves a partial update, and a failed event write leaves a gap (sections 4.5 and 6). | One transaction per update covering tasks, requests and events. The retry is then fully safe. |
+| One open request per patient and department | Checked in code, raising `DuplicateOpenRequestError`. | A partial unique index on `(patient_id, assigned_to)` where `status = 'Open'`. A concurrent double create fails instead of producing a duplicate. |
+| Bulk task upsert | One lookup and write per task. | A single bulk upsert (`INSERT ... ON CONFLICT` or `bulkWrite`) on a unique index on the task id. |
+| Patient lookups | Full scans of the tasks and requests tables. | Indexes on `patient_id` and `status` for tasks and requests, on `(task_id, timestamp)` and `patient_id` for events. |
+| Stale or duplicate delivery | The upsert overwrites with whatever arrives last. | Write a task only if its `updated_date` is newer than the stored one (a conditional update), and keep a processed-batch id to drop a duplicate delivery. |
+| Concurrent updates | Not handled. | Row locks or optimistic versioning on the patient's requests, or process one patient at a time (a queue partitioned by `patient_id`). |
+| Event log | A table that grows without bound. | Partition by time and apply a retention policy, with access controls because it holds patient identifiers. |
+| Environments | A relative file path, and tests write to the checked-in `tinydb/db.json`. | Connection settings from the environment, tests on an in-memory or temporary database, and schema changes through migrations. |
+
+### 9.2 Observability tools
+
+Today there is one INFO stats line per update and DEBUG lines per decision, written to stdout, and they follow the PHI
+rule of ids and counts only (section 6). In production:
+
+- **Metrics:** export the numbers of the stats line to Prometheus or OpenTelemetry, instead of parsing logs:
+  - counters for `changed_tasks`, requests `created`, `rebuilt` and `closed`, and events by reason (including
+    skipped replayed `closed` events),
+  - a histogram of the update duration, and of the storing and updating stages separately,
+  - a counter of failures by stage and exception type.
+- **Tracing:** one trace per `process_tasks_update`, with spans for storing tasks, loading the patients, reconciling
+  and recording events. It shows which stage is slow, and an update id ties it to the logs.
+- **Structured logs:** JSON lines with a correlation id per update, shipped to a central system (ELK, Loki or
+  Datadog). The PHI rule stays, and a log filter that drops unexpected fields makes it hold even if a developer adds
+  one by mistake. Keep the test that checks that no message, medication or department is logged.
+- **Alerts:**
+  - any update that fails, and the failed event write that needs a backfill (it logs the task ids),
+  - `DuplicateOpenRequestError`, which means the invariant broke,
+  - update duration above the 2 minute interval between updates, because they would start to queue,
+  - a rise in `closed` events without a request, or in events per update, which points to bad input or a reconcile bug.
+- **Dashboards and audit:** updates per minute, duration percentiles, open requests per department, and a way for
+  support to look up the events of a `task_id` or `patient_id` (section 3.5) with access logged.
+- **Health checks:** a readiness check that tests the database connection, and a "last update processed" age that
+  alerts if updates stop arriving.
