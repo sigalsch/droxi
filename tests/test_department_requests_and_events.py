@@ -6,9 +6,9 @@ from tinydb import where
 import db.db_tinydb as db
 from clinic_manager import ClinicManager
 from main import load_all_inputs
-from models import PatientTask, TaskInput
+from models import PatientRequest, PatientTask, TaskInput
 from services.patient_department_request_service import DepartmentPatientRequestService
-from services.task_event_service import RequestSlot, build_task_events
+from services.task_event_service import build_task_events
 from services.task_service import TaskService
 
 
@@ -70,7 +70,9 @@ def test_request_that_loses_all_its_tasks_is_closed_and_cleared(manager, inputs)
     assert closed['id'] == radiology_id
     assert closed['messages'] == []
     assert closed['medications'] == []
-    assert events_of(reason='request_closed_empty')[0]['from_request_id'] == radiology_id
+    assert not closed['task_ids']
+    assert events_of(task_id='task3', reason='moved')[
+        0]['from_request_id'] == radiology_id
 
 
 def test_closing_a_request_clears_its_data(manager, inputs):
@@ -97,8 +99,8 @@ def test_task_closed_and_moved_in_the_same_update(manager, inputs):
     assert requests_of('patient2', 'Open') == []
     (closed,) = events_of(task_id='task5', reason='closed')
     assert closed['from_request_id'] == dermatology_id
-    assert (closed['from_department'], closed['to_department']
-            ) == ('Dermatology', 'Primary')
+    assert closed['from_department'] == 'Dermatology'
+    assert closed['to_request_id'] is None
 
 
 def test_new_task_never_reopens_a_closed_request(manager, inputs):
@@ -163,36 +165,53 @@ def test_only_the_touched_patients_are_loaded(inputs):
     assert requested == [{'patient1', 'patient2', 'patient3'}, {'patient3'}]
 
 
+def test_task_closed_without_ever_having_a_request_is_recorded(manager):
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task9', 'patient9', 'Primary', status='Closed')]))
+
+    assert requests_of('patient9') == []
+    (closed,) = events_of(task_id='task9')
+    assert closed['reason'] == 'closed'
+    assert closed['from_request_id'] is None
+    assert closed['to_request_id'] is None
+
+
 def test_build_task_events_ignores_unchanged_tasks():
-    primary = RequestSlot('request-1', 'Primary')
-    now = datetime.now(timezone.utc)
+    primary = request_with('request-1', 'Primary', {'task1'})
 
-    events = build_task_events(
-        'patient1', {'task1': primary}, {'task1': primary}, {'task1': 'Primary'}, [], now)
-
-    assert events == []
+    assert build_task_events(
+        [task_for('task1', 'patient1', 'Primary')], [primary], [primary]) == []
 
 
 def test_build_task_events_reasons():
-    primary = RequestSlot('request-1', 'Primary')
-    radiology = RequestSlot('request-2', 'Radiology')
-    now = datetime.now(timezone.utc)
+    primary_before = request_with('request-1', 'Primary', {'closed'})
+    radiology_before = request_with('request-2', 'Radiology', {'moved'})
+    primary_after = request_with('request-1', 'Primary', {'moved', 'created'})
+    changed = [task_for(task_id, 'patient1', 'Primary', status)
+               for task_id, status in [('closed', 'Closed'), ('created', 'Open'),
+                                       ('moved', 'Open'), ('unplaced', 'Closed')]]
 
     events = build_task_events(
-        'patient1',
-        old_membership={'moved': radiology, 'closed': primary},
-        new_membership={'moved': primary, 'created': primary},
-        task_departments={'closed': 'Primary'},
-        emptied_requests=[radiology],
-        timestamp=now)
+        changed, [primary_before, radiology_before], [primary_after])
 
-    assert [(e.task_id, e.reason) for e in events] == [
-        ('closed', 'closed'), ('created', 'created'), ('moved', 'moved'), (None, 'request_closed_empty')]
+    assert [(e.task_id, e.reason, e.from_request_id, e.to_request_id) for e in events] == [
+        ('closed', 'closed', 'request-1', None),
+        ('created', 'created', None, 'request-1'),
+        ('moved', 'moved', 'request-2', 'request-1'),
+        ('unplaced', 'closed', None, None)]
 
 
-def task_for(task_id, patient_id, department) -> PatientTask:
+def request_with(request_id, department, task_ids) -> PatientRequest:
+    return PatientRequest(
+        id=request_id, patient_id='patient1', status='Open', assigned_to=department,
+        created_date=datetime(2023, 5, 3, tzinfo=timezone.utc),
+        updated_date=datetime(2023, 5, 3, tzinfo=timezone.utc),
+        messages=[], pharmacy_id=None, task_ids=task_ids)
+
+
+def task_for(task_id, patient_id, department, status='Open') -> PatientTask:
     return PatientTask(
-        id=task_id, patient_id=patient_id, status='Open', assigned_to=department,
+        id=task_id, patient_id=patient_id, status=status, assigned_to=department,
         created_date=datetime(2023, 5, 3, tzinfo=timezone.utc),
         updated_date=datetime(2023, 7, 1, tzinfo=timezone.utc),
         message='Moved back')
