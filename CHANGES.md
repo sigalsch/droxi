@@ -188,21 +188,27 @@ patients were touched, so the full scan stays. `PerPatientRequestService` absorb
 are intact.
 
 ### 4.4 Smaller choices and assumptions
+
 - **Department key:** `assigned_to` is used as is. `PatientRequest` has no new field.
+
 - **Assumption, closed request `task_ids` can be empty.** When a request closes, its `task_ids` are the tasks of its
   department that arrived closed in that update. Nothing else is available, because the other tasks are gone from the
   group. So:
-  - closed because its tasks were closed: `task_ids` holds those tasks (patient1 Primary: `task1`, `task4`),
-  - closed because all its tasks moved away: `task_ids` is **empty** (patient3 Radiology),
-  - a task that closes while moving is listed in the request of its **new** department, and the request it left is
-    empty (`task5`: Dermatology is empty, Primary holds `task400` and `task5`).
+
+    - closed because its tasks were closed: `task_ids` holds those tasks (patient1 Primary: `task1`, `task4`),
+    - closed because all its tasks moved away: `task_ids` is **empty** (patient3 Radiology),
+    - a task that closes while moving is listed in the request of its **new** department, and the request it left is
+      empty (`task5`: Dermatology is empty, Primary holds `task400` and `task5`).
 
   A closed request therefore does not list every task it ever held. A task that closed in an earlier update, such as
   `task2`, is no longer in it. Where a task went is in the events (`from_request_id`). Nothing in the code assumes
   `task_ids` is non-empty. Both cases are covered by tests.
+
 - **Closed request `updated_date`:** the newest of its own date and the dates of the tasks that closed in it, so it
   never goes back. A request emptied by a move keeps its old date, the move is in the events.
+
 - **`closed` events have no `to_department`:** a closed task is in no open request. Where the task is now is in the tasks table.
+
 - **A closed task that was never in an open request** (for example its first update is a close) creates no request,
   but it is recorded as a `closed` event without requests (section 3.5). Replaying such an update does not record it
   again (section 4.5).
