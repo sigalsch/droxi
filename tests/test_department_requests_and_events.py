@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -219,3 +220,25 @@ def task_for(task_id, patient_id, department, status='Open') -> PatientTask:
         created_date=datetime(2023, 5, 3, tzinfo=timezone.utc),
         updated_date=datetime(2023, 7, 1, tzinfo=timezone.utc),
         message='Moved back')
+
+
+def test_update_logs_stats_summary(manager, inputs, caplog):
+    caplog.set_level(logging.INFO)
+
+    manager.process_tasks_update(inputs[0])
+
+    (summary,) = [r.getMessage() for r in caplog.records
+                  if r.getMessage().startswith('requests updated')]
+    assert 'changed_tasks=' in summary and 'created=' in summary and 'duration_ms=' in summary
+
+
+def test_update_logs_each_group_decision_at_debug(manager, inputs, caplog):
+    caplog.set_level(logging.DEBUG)
+    manager.process_tasks_update(inputs[0])
+    manager.process_tasks_update(inputs[1])
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith('created request') for m in messages)
+    assert any(m.startswith('closed request') for m in messages)
+    assert any(' moved:' in m for m in messages)
+

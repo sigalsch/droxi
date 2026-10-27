@@ -1,7 +1,11 @@
+import logging
+
 import db.db_tinydb as db
 from models.patient_request import PatientRequest
 from models.patient_task import PatientTask
 from models.task_event import TaskEvent
+
+logger = logging.getLogger(__name__)
 
 
 def build_task_events(changed_tasks: list[PatientTask], open_before: list[PatientRequest],
@@ -40,5 +44,9 @@ class TaskEventService:
     """ Writes the append-only task event log. """
 
     def record(self, events: list[TaskEvent]):
-        if events:
-            db.task_events.insert_multiple([e.model_dump() for e in events])
+        if not events:
+            return
+        for e in events:
+            logger.debug('task %s %s: request %s (%s) -> %s (%s)', e.task_id, e.reason,
+                         e.from_request_id, e.from_department, e.to_request_id, e.to_department)
+        db.task_events.insert_multiple([e.model_dump() for e in events])

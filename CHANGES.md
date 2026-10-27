@@ -219,6 +219,7 @@ are intact.
 | `services/abstract_patient_request_service.py` | New `update_requests(changed_tasks)` signature, and the `TaskService` is held here (section 4.3). |
 | `services/patient_request_service.py` | Adapted to the new signature, with the same behavior. It now loads all open tasks itself. |
 | `clinic_manager.py` | Passes the changed tasks, no longer loads every open task. The previous code stays as a comment with the answer to the `# Question`. The default service gets the manager's `TaskService`. |
+| `main.py` | Configures logging (INFO by default). |
 | `tests/test_department_requests_and_events.py` | New tests (section 7). |
 
 ---
@@ -235,6 +236,10 @@ are intact.
 **Performance and storage**
 - **Indexes:** `patient_id` and `status` on tasks and requests, and `patient_id` on events. TinyDB has none, so the
   patient lookups are scans here.
+- **Observability:** stdlib `logging`, configured only in `main.py` (library code just gets a logger). One INFO line
+  per update with the stats (`changed_tasks`, `patients`, `created`/`rebuilt`/`closed` requests, events by reason,
+  `duration_ms`). DEBUG lines show each group decision, each event and the load sizes. In production, export the same
+  numbers as metrics (counters and a duration histogram) instead of parsing logs.
 - **Events grow without bound** and contain patient identifiers. They need a retention policy and access rules.
 
 ---

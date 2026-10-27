@@ -1,3 +1,4 @@
+import logging
 from os import PathLike
 from pathlib import Path
 from models import TaskInput
@@ -23,6 +24,8 @@ def load_all_inputs():
 
 
 def main():
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     db.init_db()
     inputs = load_all_inputs()
 
