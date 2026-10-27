@@ -35,23 +35,9 @@ class ClinicManager:
             self.task_service.updates_tasks(tasks)
             logger.debug('stored %d tasks in %.1f ms', len(tasks), elapsed_ms(started))
 
-            # Previous code:
-            #
-            # newly_closed_tasks = [t for t in tasks if t.status == 'Closed']
-            #
-            # Question: What is a potential performance issue with this code ?
-            # open_tasks = list(self.task_service.get_open_tasks())
-            #
-            # self.patient_request_service.update_requests(
-            #     open_tasks + newly_closed_tasks)
-            #
-            # Answer: get_open_tasks() loads every open task of every patient on each call, although an update
-            # only touches dozens of tasks and only thousands of the millions of patients have open requests.
-            # The cost grows with the whole open backlog instead of with the size of the update, and the
-            # service gets a list that does not say which patients were touched, so it cannot scope its work.
-            #
-            # Now the service receives only the changed tasks, and loads the other tasks it needs itself.
-            # This lets each service scope its reads to the patients touched by this update.
+            # Question: What is a potential performance issue with this code?
+            # Answer: it loaded every open task of every patient on each call, so the cost grew with the whole backlog.
+            # Now only the changed tasks are passed and the service loads the touched patients (CHANGES.md §4).
             stage = 'updating requests'
             self.patient_request_service.update_requests(tasks)
             logger.debug('tasks update processed in %.1f ms', elapsed_ms(started))
