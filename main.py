@@ -1,7 +1,9 @@
 from os import PathLike
 from pathlib import Path
 from models import TaskInput
+from clinic_manager import ClinicManager
 from observability import configure_logging
+from services.patient_department_request_service import DepartmentPatientRequestService
 import db.db_tinydb as db
 
 
@@ -28,7 +30,9 @@ def main():
     db.init_db()
     inputs = load_all_inputs()
 
-    # Optional placeholder
+    manager = ClinicManager(DepartmentPatientRequestService())
+    for task_input in inputs:
+        manager.process_tasks_update(task_input)
 
 
 if __name__ == '__main__':
