@@ -14,14 +14,11 @@ GroupKey = tuple[str, str]
 
 
 class DepartmentPatientRequestService(PatientRequestService):
-    """ Groups tasks into requests by (patient id, department), where the department is `assigned_to`.
+    """ Groups tasks into requests by (patient id, department), the department being `assigned_to`.
 
-    Invariant: a patient has at most one open request per department. A closed request is never reopened,
-    a later task for that department gets a new request.
-
-    Instead of patching requests when a task moves, every update reconciles the touched patients: it regroups
-    their open tasks by department and compares the groups with their open requests. Requests whose group
-    still has open tasks are rebuilt, new groups get a request, and requests without open tasks are closed.
+    Each update reconciles the touched patients: their tasks are regrouped by department and compared with
+    their open requests. A group with open tasks gets its request rebuilt or created, a request without open
+    tasks is closed. A patient has at most one open request per department, and a closed one is never reopened.
     """
 
     def __init__(self, task_service: TaskService | None = None,
@@ -44,14 +41,13 @@ class DepartmentPatientRequestService(PatientRequestService):
             if request:
                 open_after.append(request)
 
-        # The events are written after the requests. They are a log, so a failure here never leaves a request
-        # in a wrong state. In a real DB the writes would share a transaction.
+        # Events are written last, so a failure cannot leave a request wrong. A real DB would use one transaction.
         self.event_service.record(
             build_task_events(changed_tasks, list(open_requests.values()), open_after))
 
     def _load_tasks_by_group(self, patient_ids: set[str], changed_tasks: list[PatientTask]
                              ) -> dict[GroupKey, list[PatientTask]]:
-        """ Groups the touched patients' open tasks and the tasks that were closed by this update. """
+        """ Groups the touched patients' open tasks with the tasks closed by this update. """
         newly_closed = [t for t in changed_tasks if t.status == 'Closed']
         open_tasks = self.task_service.get_open_tasks_for_patients(patient_ids)
 
@@ -76,8 +72,7 @@ class DepartmentPatientRequestService(PatientRequestService):
 
     def _reconcile_group(self, group: GroupKey, tasks: list[PatientTask],
                          existing: PatientRequest | None) -> PatientRequest | None:
-        """ Brings the stored request of one (patient, department) in line with its tasks.
-        Returns the open request that results, or None if the group has no open request. """
+        """ Syncs the request of one group with its tasks. Returns the resulting open request, or None. """
         patient_id, _ = group
 
         if any(t.status == 'Open' for t in tasks):
@@ -90,13 +85,12 @@ class DepartmentPatientRequestService(PatientRequestService):
         if existing:
             self._save(self._close_request(existing, tasks))
 
-        # Otherwise the group only has closed tasks and no open request: nothing to open or close.
         return None
 
     @staticmethod
     def _close_request(request: PatientRequest, closed_tasks: list[PatientTask]) -> PatientRequest:
-        """ Closes a request and clears its data, the task events keep the record of what happened to its tasks.
-        `closed_tasks` are the tasks that were closed in it by this update, empty if its tasks all moved away. """
+        """ Closes a request and clears its data. `closed_tasks` are those closed in it by this update,
+        empty if its tasks all moved away. """
         return request.model_copy(update={
             'status': 'Closed',
             'messages': [],

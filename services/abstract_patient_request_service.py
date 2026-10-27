@@ -16,8 +16,7 @@ class PatientRequestService(ABC):
 
     @abstractmethod
     def update_requests(self, changed_tasks: list[PatientTask]):
-        """ Accepts the tasks that were modified in the last update (already stored by the TaskService)
-        and updates the relevant PatientRequest objects. Each service loads whatever other tasks it needs. """
+        """ Updates the patient requests for the changed tasks (already stored). Loads any other tasks it needs. """
         raise NotImplementedError
 
     def to_patient_request(self, patient_id, patient_tasks):

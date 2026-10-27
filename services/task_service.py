@@ -17,7 +17,8 @@ class TaskService:
         # Question : This code is the result of a limitation by TinyDB. What is the issue and what feature
         # would a more complete DB solution offer ?
         # Answer: TinyDB has no bulk upsert, so every task costs a separate lookup and write (N round trips),
-        # and there is no transaction, so a failure half way leaves the batch partially applied. A DB such as
+        # (and without an index on the task id each lookup also scans the whole tasks table, so the cost is
+        # about N x table size), and there is no transaction, so a failure half way leaves the batch partially applied. A DB such as
         # MongoDB offers bulkWrite with upsert (one round trip), a unique index on the task id that makes the
         # upsert atomic, and multi-document transactions for the task, request and event writes.
         for task in tasks:

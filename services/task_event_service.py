@@ -6,9 +6,8 @@ from models.task_event import TaskEvent
 
 def build_task_events(changed_tasks: list[PatientTask], open_before: list[PatientRequest],
                       open_after: list[PatientRequest]) -> list[TaskEvent]:
-    """ Records what happened to each changed task, by comparing which open request held it before and after
-    the update. A task that is in the same request in both is not an event. A task that is in no open request
-    in either (a task that arrives already closed) is still recorded, as `closed` without requests. """
+    """ One event per changed task whose open request differs before and after the update.
+    A task that arrives already closed is recorded as `closed` without requests. """
     holder_before = _request_by_task_id(open_before)
     holder_after = _request_by_task_id(open_after)
 
@@ -38,7 +37,7 @@ def _request_by_task_id(requests: list[PatientRequest]) -> dict[str, PatientRequ
 
 
 class TaskEventService:
-    """ Writes the append-only task event log. Nothing in the request flow reads it back. """
+    """ Writes the append-only task event log. """
 
     def record(self, events: list[TaskEvent]):
         if events:

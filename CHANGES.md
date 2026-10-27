@@ -261,12 +261,15 @@ Run with `pytest` from the project root.
 ## 8. Questions and observations
 
 ### 8.1 Answers to the questions in the code
-- **`TaskService.updates_tasks`:** TinyDB has no bulk upsert, so each task is a separate lookup and write, and there is
+- **`TaskService.updates_tasks`:** TinyDB has no bulk upsert, so each task is a separate lookup and write. Without an
+  index on the task id each lookup also scans the whole tasks table (about N x table size). There is
   no transaction, so a failure half way leaves the batch partly applied. MongoDB offers `bulkWrite` with upsert, a
   unique index on the task id for atomic upserts, and multi-document transactions.
 - **`ClinicManager`:** it loaded every open task of every patient on each call, although an update touches dozens of
   tasks and there are thousands of patients with open requests. The cost grew with the whole backlog instead of the
   update size. The department service now loads only the touched patients' tasks.
+- **`PerPatientRequestService`:** same full scan (kept, to preserve the old behavior). In addition it runs one query
+  per patient to find the open request (N+1) and rewrites every open request even when nothing changed.
 
 ### 8.2 Other observations
 - `get_open_tasks` returned a generator that was immediately turned into a list.

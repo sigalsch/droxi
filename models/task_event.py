@@ -10,11 +10,10 @@ def _utc_now() -> datetime:
 
 
 class TaskEvent(BaseModel):
-    """ An append-only audit record of a task entering, moving between, or leaving open patient requests.
+    """ Audit record of a task entering, moving between, or leaving open requests.
 
-    `created`: the task entered an open request.
-    `moved`: the task left one open request and entered another (a department change).
-    `closed`: the task was closed. It left its open request, or it was never in one.
+    `created`: entered an open request. `moved`: switched to another open request (department change).
+    `closed`: task closed, it left its open request or never had one.
     """
     patient_id: str
     task_id: str
