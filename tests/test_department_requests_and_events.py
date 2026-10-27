@@ -97,6 +97,10 @@ def test_task_closed_and_moved_in_the_same_update(manager, inputs):
     manager.process_tasks_update(inputs[2])
 
     assert requests_of('patient2', 'Open') == []
+    # task5 closed in Primary, so the Dermatology request it left is empty and the Primary request holds it
+    assert not request_for('patient2', 'Dermatology', 'Closed')['task_ids']
+    assert set(request_for('patient2', 'Primary', 'Closed')
+               ['task_ids']) == {'task400', 'task5'}
     (closed,) = events_of(task_id='task5', reason='closed')
     assert closed['from_request_id'] == dermatology_id
     assert closed['from_department'] == 'Dermatology'

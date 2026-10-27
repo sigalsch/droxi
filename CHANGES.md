@@ -5,14 +5,14 @@
 Requests are now grouped by `(patient_id, department)` instead of by `patient_id` only. The department is the task's
 `assigned_to`, and a task can move between departments.
 
-The chosen approach is a **patient-scoped reconcile plus an append-only audit event log** (Option 2 in section 3.1).
-Each update regroups only the touched patients' tasks by department and brings their open requests in line with the
+The chosen approach is a **patient-scoped reconcile plus an append-only audit event log** (the three decisions are in
+section 3). Each update regroups only the touched patients' tasks by department and brings their open requests in line with the
 groups. The change is in `DepartmentPatientRequestService`. The old `PerPatientRequestService` keeps its behavior.
 
 | Section | What it covers |
 |---|---|
 | [2. Problem](#2-problem) | Constraints, and why grouping by department breaks when a task moves. |
-| [3. Design](#3-design) | The options considered, the chosen flow, and the audit events. |
+| [3. Design](#3-design) | Three decisions with their options, pros and cons, then the chosen flow and the audit events. |
 | [4. Behavior decisions](#4-behavior-decisions) | Clearing data on close, never reopening, the interface change. |
 | [5. Code changes](#5-code-changes) | One line per changed file. |
 | [6. Trade-offs and production notes](#6-trade-offs-and-production-notes) | What a real DB would change, and known limits. |
@@ -47,38 +47,83 @@ patient3 goes from 2 open requests to 1 in update 2.
 
 ## 3. Design
 
-### 3.1 Options considered
+Three decisions were taken in order. The first picks the approach, the other two refine it:
 
-Options 1 and 2 add a `task_events` collection with one document per change (task, patient, request and department
-before and after, reason, timestamp). Option 3 does not.
+| # | Decision | Chosen |
+|---|---|---|
+| 1 | [How to handle a move](#31-decision-1-how-to-handle-a-move) | Reconcile the requests from the tasks |
+| 2 | [How much to reconcile per update](#32-decision-2-scope-of-the-reconcile) | Only the patients touched by the update |
+| 3 | [How to keep the move history](#33-decision-3-move-history) | An append-only event collection |
 
-**Option 1: audit-driven incremental update.** The latest event of a task says which request holds it. For each changed
-task, find the old request, detach the task and recompute that request (close it if no open tasks remain), then find or
-create the open `(patient, department)` request and attach the task.
-- Pros: cheapest per update, no scan. Moves are solved directly.
-- Cons: correctness depends on the event log. It needs an index on `task_id` and `timestamp`, and a multi-write
-  transaction in production. More than "dozens of tasks per update" needs.
+The sections after them describe the result: [3.4 how an update is processed](#34-how-an-update-is-processed) and
+[3.5 the audit events](#35-audit-events).
 
-**Option 2 (chosen): patient-scoped reconcile plus audit events.** For each patient in the update, load their open tasks
-and open requests, regroup the tasks by department, and update, create or close requests so they match the groups.
-Events are derived afterwards and only written.
-- Pros: work is proportional to the update size. One rule covers moves and fully emptied departments. The requests are
-  always rebuilt from tasks, so a bug in the event log cannot corrupt them. Durable move history.
-- Cons: the service interface changes slightly (see section 4.3), and a request is rebuilt even if little changed.
+### 3.1 Decision 1: how to handle a move
 
-**Option 3: patient-scoped reconcile, logging only.** The same reconcile, with moves written as log lines.
-- Pros: smallest data-model change.
-- Cons: history is not durable or queryable, it lasts as long as the logs.
+**A. Incremental update with tracked membership.** Remember which request holds each task (for example in the latest
+audit event, or a `request_id` stored with the task). For each changed task, find the old request, detach the task,
+recompute that request and close it if no open tasks remain, then find or create the new `(patient, department)`
+request and attach the task.
+- Pros: cheapest per update, only two requests are touched per task.
+- Cons: the membership is a second source of truth that must stay in sync with the requests, and correctness depends on
+  it. It needs an index on the task id and a multi-write transaction in production. More than "dozens of tasks per
+  update" needs.
 
-**Alternative: global rebuild plus reconcile.** Keep the old contract (all open tasks plus newly closed ones), group
-them by `(patient_id, department)`, and close open requests of the touched patients whose key was not produced.
-- Pros: smallest diff.
-- Cons: keeps the full scan on every update.
+**B. Reconcile from the tasks (chosen).** Regroup the tasks by `(patient_id, department)` and bring the open requests in
+line with the groups: rebuild a request whose group has open tasks, create one for a new group, close one whose group
+has no open tasks.
+- Pros: nothing to keep in sync, requests are always derived from tasks, as they were before. One rule covers a move and
+  a fully emptied department.
+- Cons: a request is rebuilt even if little changed.
 
-### 3.2 How an update is processed (Option 2)
+**Why B:** the rebuild is cheap at this scale, and it fixes the stale-request problem (section 2.2) with the same rule
+that closes any request, instead of tracking where each task lives. Decision 2 limits the rebuild to the touched patients.
+
+### 3.2 Decision 2: scope of the reconcile
+
+**A. Global.** Keep the old contract: `ClinicManager` passes all open tasks of all patients plus the newly closed ones.
+Group them, and close any open request whose `(patient, department)` has no group.
+- Pros: smallest change. No interface change, and the old service is untouched.
+- Cons: every update, which arrives every 2 minutes, reads all open tasks and rewrites every open request for
+  thousands of patients, to process dozens of changes. The service cannot tell which patients were touched, because the
+  list mixes changed and unchanged tasks.
+
+**B. Only the touched patients (chosen).** `ClinicManager` passes only the changed tasks. The service loads the open
+tasks and open requests of those patients and reconciles them.
+- Pros: work is proportional to the update size. It fixes the performance issue flagged in `ClinicManager`.
+- Cons: the service interface changes (section 4.3), and it needs a lookup of open tasks by patient (an index on
+  `patient_id` in a real DB).
+
+**Why B:** the README says updates carry dozens of tasks, and only thousands of the millions of patients have open
+requests, so a full scan on every call does not fit.
+
+### 3.3 Decision 3: move history
+
+After a move or a close, a rebuilt request no longer shows what it used to contain, and closed requests have their data
+cleared (section 4.1). So the question is whether to keep a record outside the requests.
+
+**A. No history.** Nothing is stored.
+- Pros: simplest.
+- Cons: a request that closed because its tasks moved away looks the same as one a doctor handled, and nothing says
+  where a task went.
+
+**B. Log lines.** Moves are written as structured log lines.
+- Pros: no new collection.
+- Cons: not durable or queryable, it lasts as long as the logs are kept.
+
+**C. Event collection (chosen).** One document per task change, in an append-only `TaskEvents` collection that is only
+written, never read by the request flow.
+- Pros: durable and queryable. A bug in it cannot corrupt a request.
+- Cons: an extra write per task change, a new collection to retain, and it holds patient identifiers.
+
+**Why C:** with data cleared on close, the events are the only record of what happened to a request's tasks.
+Section 3.5 has the rationale and the shape of the events.
+
+### 3.4 How an update is processed
 
 1. `ClinicManager` stores the changed tasks, then calls `update_requests(changed_tasks)`.
-2. The service takes the touched patient ids and loads **only those patients'** open tasks and open requests.
+2. The service takes the touched patient ids and loads **only those patients'** open tasks and open requests. The tasks
+   closed by this update are added, because they are no longer open in the DB.
 3. Tasks are grouped by `(patient_id, department)` and compared with the open requests, one per group:
    - **Group has an open task, request exists:** the request is rebuilt from the tasks (existing `to_patient_request`), keeping its id.
    - **Group has an open task, no request:** a new request is inserted.
@@ -90,7 +135,7 @@ Why this handles moves: a department that lost all its tasks has an open request
 by the same rule that closes any other request. It also covers `task5` in the test data, which is closed and moved
 from Dermatology to Primary in the same update.
 
-### 3.3 Audit events
+### 3.5 Audit events
 
 **Why keep them.** Requests are rebuilt on every update, so after a move or a close nothing in them shows what they
 used to contain.
@@ -114,7 +159,7 @@ used to contain.
 - **Write only:** nothing reads the log. Requests are written first and events last.
 - **Timestamps:** the event sets its own UTC processing time. A request's `updated_date` comes from task data.
 
-**Cost.** One extra write per task that moved, closed or was created. The events contain patient identifiers, so
+**Cost.** One extra event per task that was created, moved or closed, written in one batch per update. The events contain patient identifiers, so
 retention and access rules apply (see section 6).
 
 ---
@@ -123,8 +168,8 @@ retention and access rules apply (see section 6).
 
 ### 4.1 Clear the data on every request that closes
 The README says that when a task is closed, its data must be removed. So any request that closes (all its tasks
-closed, or all its tasks moved away) gets `messages=[]` and `medications=[]`. It keeps `task_ids` (only the tasks that
-closed in it) and `updated_date`, so it remains as medical history.
+closed, or all its tasks moved away) gets `messages=[]` and `medications=[]`. It stays as medical history, with its
+`task_ids` and `updated_date` set as described in section 4.4.
 
 This is a deliberate change from `PerPatientRequestService`, which keeps the data of the closed tasks on the closed
 request. That service is unchanged, so its tests still describe the old behavior.
@@ -139,14 +184,24 @@ the other tasks it needs. With the old contract (all open tasks plus newly close
 patients were touched, so the full scan stays. `PerPatientRequestService` absorbed that scan, so its behavior and tests
 are intact.
 
-### 4.4 Smaller choices
+### 4.4 Smaller choices and assumptions
 - **Department key:** `assigned_to` is used as is. `PatientRequest` has no new field.
-- **Closed request `task_ids`:** only the tasks that closed in it. Tasks that moved away are in the events.
-- **Closed request `updated_date`:** the newest date of the tasks that closed in it. A request emptied by a move
-  keeps its old date, the move is in the events.
+- **Assumption, closed request `task_ids` can be empty.** When a request closes, its `task_ids` are the tasks of its
+  department that arrived closed in that update. Nothing else is available, because the other tasks are gone from the
+  group. So:
+  - closed because its tasks were closed: `task_ids` holds those tasks (patient1 Primary: `task1`, `task4`),
+  - closed because all its tasks moved away: `task_ids` is **empty** (patient3 Radiology),
+  - a task that closes while moving is listed in the request of its **new** department, and the request it left is
+    empty (`task5`: Dermatology is empty, Primary holds `task400` and `task5`).
+
+  A closed request therefore does not list every task it ever held. A task that closed in an earlier update, such as
+  `task2`, is no longer in it. Where a task went is in the events (`from_request_id`). Nothing in the code assumes
+  `task_ids` is non-empty. Both cases are covered by tests.
+- **Closed request `updated_date`:** the newest of its own date and the dates of the tasks that closed in it, so it
+  never goes back. A request emptied by a move keeps its old date, the move is in the events.
 - **`closed` events have no `to_department`:** a closed task is in no open request. Where the task is now is in the tasks table.
 - **A closed task that was never in an open request** (for example its first update is a close) creates no request,
-  but it is recorded as a `closed` event without requests (section 3.3). Replaying such an update records it again.
+  but it is recorded as a `closed` event without requests (section 3.5). Replaying such an update records it again.
 
 ---
 
@@ -156,14 +211,14 @@ are intact.
 
 | File | Change |
 |---|---|
-| `services/patient_department_request_service.py` | `DepartmentPatientRequestService`, implementing section 3.2. |
+| `services/patient_department_request_service.py` | `DepartmentPatientRequestService`, implementing section 3.4. |
 | `services/task_event_service.py` | New. `build_task_events` and `TaskEventService`. |
 | `models/task_event.py` | New `TaskEvent` model, exported from `models`. |
 | `db/db_tinydb.py` | New `TaskEvents` table. |
-| `services/task_service.py` | New `get_open_tasks_for_patients(patient_ids)`. |
+| `services/task_service.py` | New `get_open_tasks_for_patients(patient_ids)`, and the answer to the `# Question` comment. |
 | `services/abstract_patient_request_service.py` | New `update_requests(changed_tasks)` signature, and the `TaskService` is held here (section 4.3). |
-| `services/patient_request_service.py` | Adapted to the new signature, with the same behavior. |
-| `clinic_manager.py` | Passes the changed tasks, no longer loads every open task. |
+| `services/patient_request_service.py` | Adapted to the new signature, with the same behavior. It now loads all open tasks itself. |
+| `clinic_manager.py` | Passes the changed tasks, no longer loads every open task. The previous code stays as a comment with the answer to the `# Question`. The default service gets the manager's `TaskService`. |
 | `tests/test_department_requests_and_events.py` | New tests (section 7). |
 
 ---
@@ -190,9 +245,9 @@ are intact.
   behavior) pass.
 - `tests/test_department_requests_and_events.py` adds:
   - move events with the old and new request and department,
-  - a request that loses all its tasks is closed and cleared,
-  - closing a request clears its data,
-  - a task closed and moved in one update,
+  - a request that loses all its tasks is closed and cleared, with empty `task_ids`,
+  - closing a request clears its data and keeps the tasks that closed in it,
+  - a task closed and moved in one update, including the `task_ids` of both requests,
   - a task that was closed without ever having a request is recorded,
   - a new task does not reopen a closed request, and a task moving back creates a new one,
   - replaying an update changes nothing,
