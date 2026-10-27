@@ -3,6 +3,7 @@ from models.patient_task import PatientTask
 from uuid import uuid4
 
 from models.patient_request import PatientRequest
+from .task_service import TaskService
 from operator import attrgetter
 
 task_date_getter = attrgetter('updated_date')
@@ -10,9 +11,13 @@ task_date_getter = attrgetter('updated_date')
 
 class PatientRequestService(ABC):
 
+    def __init__(self, task_service: TaskService | None = None):
+        self.task_service = task_service or TaskService()
+
     @abstractmethod
-    def update_requests(self, tasks: list[PatientTask]):
-        """ Accepts a list of modified and open tasks and updates the relevant PatientRequest objects. """
+    def update_requests(self, changed_tasks: list[PatientTask]):
+        """ Accepts the tasks that were modified in the last update (already stored by the TaskService)
+        and updates the relevant PatientRequest objects. Each service loads whatever other tasks it needs. """
         raise NotImplementedError
 
     def to_patient_request(self, patient_id, patient_tasks):

@@ -24,7 +24,13 @@ class PerPatientRequestService(PatientRequestService):
 
         return PatientRequest(**result_dict)
 
-    def update_requests(self, tasks: list[PatientTask]):
+    def update_requests(self, changed_tasks: list[PatientTask]):
+
+        newly_closed_tasks = [t for t in changed_tasks if t.status == 'Closed']
+        # Question: What is a potential performance issue with this code ?
+        # Answer: it loads every open task of every patient on each call, although an update only
+        # touches dozens of tasks. See DepartmentPatientRequestService for the patient scoped version.
+        tasks = list(self.task_service.get_open_tasks()) + newly_closed_tasks
 
         grouped_by_patient: dict[str, list[PatientTask]] = defaultdict(list)
 

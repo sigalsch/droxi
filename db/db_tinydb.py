@@ -27,6 +27,8 @@ clinic = TinyDB("tinydb/db.json", create_dirs=True, storage=serialization)
 
 patient_requests = clinic.table('PatientRequest')
 tasks = clinic.table('Tasks')
+# Append-only audit log of task movements between requests. Written, never read by the business logic.
+task_events = clinic.table('TaskEvents')
 # either creates a new database file or accesses an existing one named `my_tiny_database`
 
 
