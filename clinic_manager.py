@@ -3,6 +3,7 @@ import logging
 from time import perf_counter
 
 from models import TaskInput
+from observability import elapsed_ms
 from services.patient_request_service import PerPatientRequestService
 from services.abstract_patient_request_service import PatientRequestService
 from services.task_service import TaskService
@@ -27,27 +28,34 @@ class ClinicManager:
             return
 
         started = perf_counter()
-        self.task_service.updates_tasks(tasks)
-        logger.debug('stored %d tasks in %.1f ms', len(tasks),
-                     (perf_counter() - started) * 1000)
+        stage = 'storing tasks'
+        # The error is logged with its type only, its message may hold task data (PHI rule).
+        # Safe for the caller to retry: storing tasks and updating requests are both idempotent.
+        try:
+            self.task_service.updates_tasks(tasks)
+            logger.debug('stored %d tasks in %.1f ms', len(tasks), elapsed_ms(started))
 
-        # Previous code:
-        #
-        # newly_closed_tasks = [t for t in tasks if t.status == 'Closed']
-        #
-        # Question: What is a potential performance issue with this code ?
-        # open_tasks = list(self.task_service.get_open_tasks())
-        #
-        # self.patient_request_service.update_requests(
-        #     open_tasks + newly_closed_tasks)
-        #
-        # Answer: get_open_tasks() loads every open task of every patient on each call, although an update
-        # only touches dozens of tasks and only thousands of the millions of patients have open requests.
-        # The cost grows with the whole open backlog instead of with the size of the update, and the
-        # service gets a list that does not say which patients were touched, so it cannot scope its work.
-        #
-        # Now the service receives only the changed tasks, and loads the other tasks it needs itself.
-        # This lets each service scope its reads to the patients touched by this update.
-        self.patient_request_service.update_requests(tasks)
-        logger.debug('tasks update processed in %.1f ms',
-                     (perf_counter() - started) * 1000)
+            # Previous code:
+            #
+            # newly_closed_tasks = [t for t in tasks if t.status == 'Closed']
+            #
+            # Question: What is a potential performance issue with this code ?
+            # open_tasks = list(self.task_service.get_open_tasks())
+            #
+            # self.patient_request_service.update_requests(
+            #     open_tasks + newly_closed_tasks)
+            #
+            # Answer: get_open_tasks() loads every open task of every patient on each call, although an update
+            # only touches dozens of tasks and only thousands of the millions of patients have open requests.
+            # The cost grows with the whole open backlog instead of with the size of the update, and the
+            # service gets a list that does not say which patients were touched, so it cannot scope its work.
+            #
+            # Now the service receives only the changed tasks, and loads the other tasks it needs itself.
+            # This lets each service scope its reads to the patients touched by this update.
+            stage = 'updating requests'
+            self.patient_request_service.update_requests(tasks)
+            logger.debug('tasks update processed in %.1f ms', elapsed_ms(started))
+        except Exception as error:
+            logger.error('tasks update failed while %s: tasks=%d error=%s',
+                         stage, len(tasks), type(error).__name__)
+            raise

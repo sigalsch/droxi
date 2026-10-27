@@ -14,6 +14,7 @@ groups. The change is in `DepartmentPatientRequestService`. The old `PerPatientR
 | [2. Problem](#2-problem) | Constraints, and why grouping by department breaks when a task moves. |
 | [3. Design](#3-design) | Three decisions with their options, pros and cons, then the chosen flow and the audit events. |
 | [4. Behavior decisions](#4-behavior-decisions) | Clearing data on close, never reopening, the interface change. |
+| [4.5 Idempotency](#45-idempotency) | Why a retried or replayed update is safe, the one gap that was fixed, and what is not covered. |
 | [5. Code changes](#5-code-changes) | One line per changed file. |
 | [6. Trade-offs and production notes](#6-trade-offs-and-production-notes) | What a real DB would change, and known limits. |
 | [7. Tests](#7-tests) | The tests that were added. |
@@ -156,7 +157,8 @@ used to contain.
   gets a `closed` event with no request on either side. No request is created for it.
 - **Unchanged is not an event:** a task that stays in the same request produces nothing, so replaying an update of open
   tasks adds no events.
-- **Write only:** nothing reads the log. Requests are written first and events last.
+- **Mostly write only:** the request flow never reads it, except for one lookup that skips a replayed `closed` event
+  (section 4.5). Requests are written first and events last.
 - **Timestamps:** the event sets its own UTC processing time. A request's `updated_date` comes from task data.
 
 **Cost.** One extra event per task that was created, moved or closed, written in one batch per update. The events contain patient identifiers, so
@@ -201,7 +203,44 @@ are intact.
   never goes back. A request emptied by a move keeps its old date, the move is in the events.
 - **`closed` events have no `to_department`:** a closed task is in no open request. Where the task is now is in the tasks table.
 - **A closed task that was never in an open request** (for example its first update is a close) creates no request,
-  but it is recorded as a `closed` event without requests (section 3.5). Replaying such an update records it again.
+  but it is recorded as a `closed` event without requests (section 3.5). Replaying such an update does not record it
+  again (section 4.5).
+
+### 4.5 Idempotency
+
+An update can be delivered twice, for example when the caller retries after a timeout or after
+`process_tasks_update` raised. Processing the same update again must leave the same state. It is idempotent for
+all the writes:
+
+| Write | Why a replay is safe |
+|---|---|
+| Tasks | `TaskService.updates_tasks` upserts by task id, so the same task overwrites itself. |
+| Requests | The requests are derived from the tasks, not from the update. A replay regroups the same tasks, finds the open request of the group and rebuilds it with its **existing id** (`_save` upserts by id). A request that was closed has no open request, so a replay cannot match it and does not create a new one (section 4.2). |
+| Events | One event is written per **change of open request**. After the first run the tasks already sit in their final requests, so a replay finds no change and writes nothing (`created`, `moved`). |
+
+**The gap that was fixed: `closed` events.** A task that closed has no open request before the update and none after,
+and that is exactly how a replay of its close looks. So `build_task_events` produced the `closed` event again, and
+every retry of an update with closed tasks appended duplicates to the log. `TaskEventService.record` now skips a
+`closed` event that has no `from_request_id` when the **last event of that task is already `closed`**:
+- A close that left an open request has `from_request_id` set. It is a real change and is always written, and
+  it cannot repeat, because the request is already closed.
+- A task that is reopened gets a `created` event, so a later close is no longer "already closed" and is recorded.
+- `record` returns the events it wrote, and the stats log line counts those, not the candidates.
+- Cost: one query on `task_id` per update, only when it contains closed tasks that left no request. This is the one
+  place the request flow reads the events. It only decides whether to skip an audit row, so a wrong answer cannot
+  corrupt a request (requests are written first). In production, index `task_events` on `(task_id, timestamp)`.
+
+**Not covered:**
+- **Retry after a failed event write.** The requests are already written, so the retry finds no change and does not
+  write the missing `created` and `moved` events. This is the existing gap from section 6. The task ids are logged to
+  backfill them, and only a transaction removes it.
+- **Out-of-order or stale replays.** Replaying an old update after newer ones overwrites newer task state, because the
+  upsert has no `updated_date` check. The README guarantees ordered delivery, so only a retry of the latest update is
+  considered. Without that guarantee, skip a task whose stored `updated_date` is newer.
+- **Concurrent processing of the same update** is not handled, there is no lock or unique constraint. The unique
+  partial index of section 6 would turn a double create into an error.
+- **`PerPatientRequestService`** is unchanged. It is idempotent for open tasks (it updates the existing open request),
+  and has no events.
 
 ---
 
@@ -212,14 +251,15 @@ are intact.
 | File | Change |
 |---|---|
 | `services/patient_department_request_service.py` | `DepartmentPatientRequestService`, implementing section 3.4. |
-| `services/task_event_service.py` | New. `build_task_events` and `TaskEventService`. |
+| `services/task_event_service.py` | New. `build_task_events` and `TaskEventService`, whose `record` skips replayed `closed` events (section 4.5). |
 | `models/task_event.py` | New `TaskEvent` model, exported from `models`. |
 | `db/db_tinydb.py` | New `TaskEvents` table. |
 | `services/task_service.py` | New `get_open_tasks_for_patients(patient_ids)`, and the answer to the `# Question` comment. |
 | `services/abstract_patient_request_service.py` | New `update_requests(changed_tasks)` signature, and the `TaskService` is held here (section 4.3). |
 | `services/patient_request_service.py` | Adapted to the new signature, with the same behavior. It now loads all open tasks itself. |
 | `clinic_manager.py` | Passes the changed tasks, no longer loads every open task. The previous code stays as a comment with the answer to the `# Question`. The default service gets the manager's `TaskService`. |
-| `main.py` | Configures logging (INFO by default). |
+| `observability.py` | New. The PHI logging rule, `configure_logging` and `elapsed_ms`. |
+| `main.py` | Calls `configure_logging()` (INFO by default). |
 | `tests/test_department_requests_and_events.py` | New tests (section 7). |
 
 ---
@@ -229,14 +269,22 @@ are intact.
 **Correctness**
 - **No transaction:** TinyDB cannot write requests, tasks and events atomically. With a real DB, wrap them in one
   transaction. The event write is last so a failure cannot leave a wrong request.
-- **One open request per patient and department** is enforced in code: finding two raises an error. In a real DB use a
+- **Error handling:** failures are logged with ids, counts and the exception type only, never its message (it may hold
+  task data), and then re-raised, so the caller sees the failure and can retry. Retrying `process_tasks_update` is
+  safe, storing tasks, reconciling requests and recording events are idempotent (section 4.5). `ClinicManager` logs which stage failed (storing tasks
+  or updating requests). If only the event write fails, the requests are already updated and a retry produces no
+  events, so the task ids are logged for a backfill. A single transaction would remove this gap.
+- **One open request per patient and department** is enforced in code: finding two raises `DuplicateOpenRequestError`. In a real DB use a
   partial unique index on `(patient_id, assigned_to)` where `status = 'Open'`.
 - **Ordering:** as stated in the README, there are no out-of-order or dropped events.
 
 **Performance and storage**
 - **Indexes:** `patient_id` and `status` on tasks and requests, and `patient_id` on events. TinyDB has none, so the
   patient lookups are scans here.
-- **Observability:** stdlib `logging`, configured only in `main.py` (library code just gets a logger). One INFO line
+- **Observability:** stdlib `logging`, configured only in `main.py` through `observability.py` (library code just gets
+  a logger). **PHI rule, written at the top of `observability.py`:** every log line logs ids and counts only, never
+  messages, medications, names or free-form content. Departments are not logged either, because with a patient id
+  they say where the patient was sent. A test checks that no message, medication or department reaches the logs. One INFO line
   per update with the stats (`changed_tasks`, `patients`, `created`/`rebuilt`/`closed` requests, events by reason,
   `duration_ms`). DEBUG lines show each group decision, each event and the load sizes. In production, export the same
   numbers as metrics (counters and a duration histogram) instead of parsing logs.
@@ -255,7 +303,10 @@ are intact.
   - a task closed and moved in one update, including the `task_ids` of both requests,
   - a task that was closed without ever having a request is recorded,
   - a new task does not reopen a closed request, and a task moving back creates a new one,
-  - replaying an update changes nothing,
+  - replaying an update changes nothing, and retrying each of the exercise updates right after it changes nothing
+    either, including the ones that close tasks,
+  - replaying a close of a task that never had a request adds no event, and a task closed again after being
+    reopened is recorded,
   - only the touched patients are loaded,
   - unit tests for the event diff.
 

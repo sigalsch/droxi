@@ -5,6 +5,7 @@ from time import perf_counter
 from tinydb import where
 
 import db.db_tinydb as db
+from observability import elapsed_ms
 from models.patient_request import PatientRequest
 from models.patient_task import PatientTask
 from .abstract_patient_request_service import PatientRequestService
@@ -12,6 +13,11 @@ from .task_event_service import TaskEventService, build_task_events
 from .task_service import TaskService
 
 logger = logging.getLogger(__name__)
+
+
+class DuplicateOpenRequestError(ValueError):
+    """ A patient has two open requests for the same department, which breaks the grouping invariant. """
+
 
 # A request holds the tasks of one patient in one department: (patient_id, department)
 GroupKey = tuple[str, str]
@@ -51,7 +57,15 @@ class DepartmentPatientRequestService(PatientRequestService):
         # Events are written last, so a failure cannot leave a request wrong. A real DB would use one transaction.
         events = build_task_events(
             changed_tasks, list(open_requests.values()), open_after)
-        self.event_service.record(events)
+        try:
+            # Returns the events written: a replayed update does not duplicate its `closed` events.
+            events = self.event_service.record(events)
+        except Exception as error:
+            # The requests are already written and a replay produces no events, so the task ids are logged
+            # to allow a backfill. A real DB would write requests and events in one transaction.
+            logger.error('failed to record %d task events after updating requests: task_ids=%s error=%s',
+                         len(events), [e.task_id for e in events], type(error).__name__)
+            raise
 
         event_reasons = Counter(e.reason for e in events)
         logger.info(
@@ -59,7 +73,7 @@ class DepartmentPatientRequestService(PatientRequestService):
             'events=%d (created=%d moved=%d closed=%d) duration_ms=%.1f',
             len(changed_tasks), len(patient_ids), actions['created'], actions['rebuilt'], actions['closed'],
             len(events), event_reasons['created'], event_reasons['moved'], event_reasons['closed'],
-            (perf_counter() - started) * 1000)
+            elapsed_ms(started))
 
     def _load_tasks_by_group(self, patient_ids: set[str], changed_tasks: list[PatientTask]
                              ) -> dict[GroupKey, list[PatientTask]]:
@@ -84,8 +98,9 @@ class DepartmentPatientRequestService(PatientRequestService):
             request = PatientRequest(**doc)
             group = (request.patient_id, request.assigned_to)
             if group in grouped:
-                raise ValueError(
-                    f'Patient {group[0]} has more than one open request for {group[1]}')
+                raise DuplicateOpenRequestError(
+                    f'Patient {group[0]} has more than one open request in one department: '
+                    f'{grouped[group].id}, {request.id}')
             grouped[group] = request
         logger.debug('loaded %d open requests for %d patients',
                      len(grouped), len(patient_ids))
@@ -96,7 +111,7 @@ class DepartmentPatientRequestService(PatientRequestService):
         """ Syncs the request of one group with its tasks.
         Returns the resulting open request (or None) and the action taken:
         'created', 'rebuilt', 'closed' or 'none'. """
-        patient_id, department = group
+        patient_id, _ = group
 
         if any(t.status == 'Open' for t in tasks):
             request = self.to_patient_request(patient_id, tasks)
@@ -104,14 +119,14 @@ class DepartmentPatientRequestService(PatientRequestService):
                 request.id = existing.id
             self._save(request)
             action = 'rebuilt' if existing else 'created'
-            logger.debug('%s request %s for %s/%s from %d tasks',
-                         action, request.id, patient_id, department, len(tasks))
+            logger.debug('%s request %s for patient %s from %d tasks',
+                         action, request.id, patient_id, len(tasks))
             return request, action
 
         if existing:
             self._save(self._close_request(existing, tasks))
-            logger.debug('closed request %s for %s/%s, %d tasks closed in it',
-                         existing.id, patient_id, department, len(tasks))
+            logger.debug('closed request %s for patient %s, %d tasks closed in it',
+                         existing.id, patient_id, len(tasks))
             return None, 'closed'
 
         return None, 'none'

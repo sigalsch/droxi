@@ -8,7 +8,8 @@ import db.db_tinydb as db
 from clinic_manager import ClinicManager
 from main import load_all_inputs
 from models import PatientRequest, PatientTask, TaskInput
-from services.patient_department_request_service import DepartmentPatientRequestService
+from services.patient_department_request_service import (
+    DepartmentPatientRequestService, DuplicateOpenRequestError)
 from services.task_event_service import build_task_events
 from services.task_service import TaskService
 
@@ -16,6 +17,9 @@ from services.task_service import TaskService
 @pytest.fixture(autouse=True)
 def empty_db():
     db.clinic.drop_tables()
+    # drop_tables leaves the module level tables with their query cache from the previous test
+    for table in (db.patient_requests, db.tasks, db.task_events):
+        table.clear_cache()
 
 
 @pytest.fixture
@@ -152,6 +156,44 @@ def test_replaying_an_update_changes_nothing(manager, inputs):
             } == {r['id'] for r in requests_before}
 
 
+def test_retrying_every_update_changes_nothing(manager, inputs):
+    """ A retry right after an update, including the updates that close tasks, whose retry used to write
+    the `closed` events again """
+    for update in inputs:
+        manager.process_tasks_update(update)
+        requests_before = db.patient_requests.all()
+        events_before = db.task_events.all()
+        tasks_before = db.tasks.all()
+
+        manager.process_tasks_update(update)
+
+        assert db.patient_requests.all() == requests_before
+        assert db.task_events.all() == events_before
+        assert db.tasks.all() == tasks_before
+
+
+def test_replaying_a_close_without_a_request_adds_no_event(manager):
+    closed = TaskInput(tasks=[
+        task_for('task9', 'patient9', 'Primary', status='Closed')])
+
+    manager.process_tasks_update(closed)
+    manager.process_tasks_update(closed)
+
+    assert len(events_of(task_id='task9')) == 1
+
+
+def test_a_task_closed_again_after_being_reopened_is_recorded(manager):
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task9', 'patient9', 'Primary', status='Closed')]))
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task9', 'patient9', 'Primary')]))
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task9', 'patient9', 'Primary', status='Closed')]))
+
+    assert [e['reason'] for e in events_of(task_id='task9')] == [
+        'closed', 'created', 'closed']
+
+
 def test_only_the_touched_patients_are_loaded(inputs):
     requested = []
 
@@ -242,3 +284,56 @@ def test_update_logs_each_group_decision_at_debug(manager, inputs, caplog):
     assert any(m.startswith('closed request') for m in messages)
     assert any(' moved:' in m for m in messages)
 
+
+def test_logs_contain_ids_and_counts_only(manager, inputs, caplog):
+    caplog.set_level(logging.DEBUG)
+    for update in inputs:
+        manager.process_tasks_update(update)
+    log_text = caplog.text
+    assert log_text
+    for task in (t for update in inputs for t in update.tasks):
+        assert task.message not in log_text
+        for medication in task.medications:
+            assert medication.name not in log_text
+    for department in ('Dermatology', 'Radiology', 'Primary'):
+        assert department not in log_text
+
+
+def test_failed_update_is_logged_without_the_error_message_and_reraised(inputs, caplog):
+    class FailingService(DepartmentPatientRequestService):
+        def update_requests(self, changed_tasks):
+            raise RuntimeError('secret message of patient')
+
+    manager = ClinicManager(FailingService())
+
+    with pytest.raises(RuntimeError):
+        manager.process_tasks_update(inputs[0])
+
+    (error,) = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert 'updating requests' in error.getMessage()
+    assert 'RuntimeError' in error.getMessage()
+    assert 'secret' not in caplog.text
+
+
+def test_failed_event_write_logs_task_ids_and_reraises(inputs, caplog):
+    class FailingEventService:
+        def record(self, events):
+            raise OSError('disk full')
+
+    manager = ClinicManager(DepartmentPatientRequestService(
+        event_service=FailingEventService()))
+
+    with pytest.raises(OSError):
+        manager.process_tasks_update(inputs[0])
+
+    assert 'failed to record' in caplog.text
+    assert 'task1' in caplog.text
+
+
+def test_two_open_requests_for_one_department_raise(manager, inputs):
+    manager.process_tasks_update(inputs[0])
+    duplicate = request_for('patient1', 'Primary', 'Open')
+    db.patient_requests.insert({**duplicate, 'id': 'duplicate-request'})
+
+    with pytest.raises(DuplicateOpenRequestError):
+        manager.process_tasks_update(inputs[1])

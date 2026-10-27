@@ -1,7 +1,7 @@
-import logging
 from os import PathLike
 from pathlib import Path
 from models import TaskInput
+from observability import configure_logging
 import db.db_tinydb as db
 
 
@@ -24,8 +24,7 @@ def load_all_inputs():
 
 
 def main():
-    logging.basicConfig(level=logging.INFO,
-                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    configure_logging()
     db.init_db()
     inputs = load_all_inputs()
 
