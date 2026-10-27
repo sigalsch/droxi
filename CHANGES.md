@@ -13,7 +13,7 @@ groups. The change is in `DepartmentPatientRequestService`. The old `PerPatientR
 |---|---|
 | [2. Problem](#2-problem) | Constraints, and why grouping by department breaks when a task moves. |
 | [3. Design](#3-design) | Three decisions with their options, pros and cons, then the chosen flow and the audit events. |
-| [4. Behavior decisions](#4-behavior-decisions) | Clearing data on close, never reopening, the interface change. |
+| [4. Behavior decisions](#4-behavior-decisions) | What a closed request keeps, never reopening, the interface change. |
 | [4.5 Idempotency](#45-idempotency) | Why a retried or replayed update is safe, the one gap that was fixed, and what is not covered. |
 | [5. Code changes](#5-code-changes) | One line per changed file. |
 | [6. Trade-offs and production notes](#6-trade-offs-and-production-notes) | What a real DB would change, and known limits. |
@@ -101,8 +101,9 @@ requests, so a full scan on every call does not fit.
 
 ### 3.3 Decision 3: move history
 
-After a move or a close, a rebuilt request no longer shows what it used to contain, and closed requests have their data
-cleared (section 4.1). So the question is whether to keep a record outside the requests.
+After a move or a close, a rebuilt request no longer shows what it used to contain (the data of a closed task is
+dropped by the rebuild), and a request emptied by a move has its data cleared (section 4.1). So the question is whether
+to keep a record outside the requests.
 
 **A. No history.** Nothing is stored.
 - Pros: simplest.
@@ -118,8 +119,9 @@ written, never read by the request flow.
 - Pros: durable and queryable. A bug in it cannot corrupt a request.
 - Cons: an extra write per task change, a new collection to retain, and it holds patient identifiers.
 
-**Why C:** with data cleared on close, the events are the only record of what happened to a request's tasks.
-Section 3.5 has the rationale and the shape of the events.
+**Why C:** a request only keeps the data of the tasks closed in its last update (section 4.1), and one emptied by a move
+keeps nothing. So the requests cannot say which request or department held a task over time, or why a request closed.
+The events are the record of that. Section 3.5 has the rationale and the shape of the events.
 
 ### 3.4 How an update is processed
 
@@ -129,7 +131,8 @@ Section 3.5 has the rationale and the shape of the events.
 3. Tasks are grouped by `(patient_id, department)` and compared with the open requests, one per group:
    - **Group has an open task, request exists:** the request is rebuilt from the tasks (existing `to_patient_request`), keeping its id.
    - **Group has an open task, no request:** a new request is inserted.
-   - **No open task, request exists:** the request is closed and its data is cleared (see section 4.1).
+   - **No open task, request exists:** the request is closed (see section 4.1). If tasks closed in it, it is built
+     by `to_patient_request` and keeps their data. If its tasks all moved away, its data is cleared.
    - **No open task, no request:** nothing happens.
 4. The open requests before and after are compared, and one event is written per task that changed request.
 
@@ -142,8 +145,9 @@ from Dermatology to Primary in the same update.
 **Why keep them.** Requests are rebuilt on every update, so after a move or a close nothing in them shows what they
 used to contain.
 - *Medical history:* answers which request and department handled a task at each point in time, and tells a request
-  that closed because its tasks moved away from one a doctor handled. Closed requests have their data cleared (see
-  section 4.1), so the events are the only record of what happened to their tasks.
+  that closed because its tasks moved away from one a doctor handled. A closed request only holds the tasks closed in
+  its last update, and one emptied by a move holds nothing (see section 4.1), so the events are what links a task to
+  the requests it passed through.
 - *Audit:* reconstructing who held a patient's task and when is reasonable for compliance.
 - *Debugging:* the ordered events of a `task_id` or `patient_id` replay what each update did, and a task with two
   entering events and no leaving event points to a reconcile bug. A query replaces searching rotated logs.
@@ -169,13 +173,33 @@ retention and access rules apply (see section 6).
 
 ## 4. Behavior decisions
 
-### 4.1 Clear the data on every request that closes
-The README says that when a task is closed, its data must be removed. So any request that closes (all its tasks
-closed, or all its tasks moved away) gets `messages=[]` and `medications=[]`. It stays as medical history, with its
-`task_ids` and `updated_date` set as described in section 4.4.
+### 4.1 What a closed request keeps
+Two README rules apply, and they do not conflict:
+- "When a single task from possibly many tasks that compose a request is `Closed`, the data of the task needs to be
+  removed" is about a request that is **still open**. `to_patient_request` already does it: it rebuilds an open
+  request from the open tasks only.
+- "Requests that were open and then closed are retained as they are medical history", and `to_patient_request`
+  deliberately keeps the data of the closed tasks when the whole request closes ("We only care about the closed
+  tasks if all the tasks are closed and we are closing the request").
 
-This is a deliberate change from `PerPatientRequestService`, which keeps the data of the closed tasks on the closed
-request. That service is unchanged, so its tests still describe the old behavior.
+So the department service does not add a rule. A request closes in one of two ways:
+
+| Why it closes | What the closed request holds |
+|---|---|
+| Its group has no open task and some tasks closed in this update | Built by `to_patient_request`, exactly as `PerPatientRequestService` does, with the existing id. It keeps the messages and medications of the tasks closed in it, and their ids. |
+| Its tasks all moved away (nothing closed in it) | Cleared: no messages, no medications, no `task_ids`. |
+
+**Why clear the emptied request.** The alternative is to leave its last snapshot. But the snapshot holds the content of
+tasks that are now open in the request of another department. Keeping it would show their messages and medications in
+a closed request of the wrong department, a second copy of the data that is no longer in sync with the task, and it
+would be mistaken for something a doctor of that department handled. Where the tasks went is in the events
+(`moved`, with the old and the new request), and the content lives with the task in its current request. This
+only affects an empty group, so it does not lose the history of a request that a doctor handled. If the reviewers
+prefer a snapshot, the change is to return the request with only its status and `task_ids` changed.
+
+**What is not in a closed request.** The data of a task that closed in an earlier update, while the request was still
+open, was already dropped by the rebuild (the first rule). So a closed request holds the tasks that closed in its
+**last** update, not every task it ever held, the same as in `PerPatientRequestService`. A test covers this.
 
 ### 4.2 Closed requests are never reopened
 Only open requests are loaded for the reconcile, so a closed request can never be matched or updated. A new task for a
@@ -204,8 +228,10 @@ are intact.
   `task2`, is no longer in it. Where a task went is in the events (`from_request_id`). Nothing in the code assumes
   `task_ids` is non-empty. Both cases are covered by tests.
 
-- **Closed request `updated_date`:** the newest of its own date and the dates of the tasks that closed in it, so it
-  never goes back. A request emptied by a move keeps its old date, the move is in the events.
+- **Closed request dates:** a request closed with tasks gets `created_date` and `updated_date` from the tasks closed in
+  it, as `to_patient_request` sets them for any request (so `created_date` is that of the oldest closed task, not of
+  the first task the request ever held, as in `PerPatientRequestService`). A request emptied by a move keeps its old
+  dates, the move is in the events.
 
 - **`closed` events have no `to_department`:** a closed task is in no open request. Where the task is now is in the tasks table.
 
@@ -305,8 +331,11 @@ every retry of an update with closed tasks appended duplicates to the log. `Task
   behavior) pass.
 - `tests/test_department_requests_and_events.py` adds:
   - move events with the old and new request and department,
-  - a request that loses all its tasks is closed and cleared, with empty `task_ids`,
-  - closing a request clears its data and keeps the tasks that closed in it,
+  - a request emptied by a move is closed and cleared, with empty `task_ids`,
+  - a request closed with its tasks keeps their data and ids, and equals the closed request of
+    `PerPatientRequestService` for the same tasks,
+  - the data of a task closed while its request is open is dropped from it, and a request with one task closed and
+    another moved away keeps only the closed one's data,
   - a task closed and moved in one update, including the `task_ids` of both requests,
   - a task that was closed without ever having a request is recorded,
   - a new task does not reopen a closed request, and a task moving back creates a new one,
@@ -336,11 +365,8 @@ Run with `pytest` from the project root.
 
 ### 8.2 Other observations
 - `get_open_tasks` returned a generator that was immediately turned into a list.
-- Unused imports and a repeated `task_date_getter` exist in the services.
 - `ClinicManager.__init__` typed its argument as `PatientRequestService = None`, it should be optional (fixed).
-- The DB path `tinydb/db.json` is relative to the working directory, and the tests write to the checked-in file.
-  Tests should use `MemoryStorage` or a temporary file.
-- `__pycache__` directories and `tinydb/db.json` are committed, and should be in `.gitignore`.
+- The DB path `tinydb/db.json` is still relative to the working directory.
 
 ---
 
@@ -362,7 +388,7 @@ Use a real database, such as PostgreSQL or MongoDB (the choice does not change t
 | Stale or duplicate delivery | The upsert overwrites with whatever arrives last. | Write a task only if its `updated_date` is newer than the stored one (a conditional update), and keep a processed-batch id to drop a duplicate delivery. |
 | Concurrent updates | Not handled. | Row locks or optimistic versioning on the patient's requests, or process one patient at a time (a queue partitioned by `patient_id`). |
 | Event log | A table that grows without bound. | Partition by time and apply a retention policy, with access controls because it holds patient identifiers. |
-| Environments | A relative file path, and tests write to the checked-in `tinydb/db.json`. | Connection settings from the environment, tests on an in-memory or temporary database, and schema changes through migrations. |
+| Environments | A relative file path (the tests already run on `MemoryStorage`). | Connection settings from the environment, tests on an in-memory or temporary database, and schema changes through migrations. |
 
 ### 9.2 Observability tools
 

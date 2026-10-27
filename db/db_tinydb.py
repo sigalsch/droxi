@@ -1,4 +1,5 @@
 import json
+import os
 from tinydb import Query, TinyDB
 from datetime import datetime
 from uuid import uuid4
@@ -22,8 +23,11 @@ serialization = SerializationMiddleware(JSONStorage)
 serialization.register_serializer(DateTimeSerializer(), 'TinyDate')
 serialization.register_serializer(SetSerializer(), 'TinySet')
 
-clinic = TinyDB("tinydb/db.json", create_dirs=True, storage=serialization)
-# clinic = TinyDB(storage=MemoryStorage)
+if os.environ.get('DROXI_DB_STORAGE') == 'memory':
+    # Used by the tests (see tests/conftest.py), so they never touch the file on disk
+    clinic = TinyDB(storage=MemoryStorage)
+else:
+    clinic = TinyDB("tinydb/db.json", create_dirs=True, storage=serialization)
 
 patient_requests = clinic.table('PatientRequest')
 tasks = clinic.table('Tasks')

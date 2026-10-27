@@ -1,12 +1,7 @@
 from collections.abc import Iterable
 from tinydb import Query, where
 from models.patient_task import PatientTask
-from models.patient_request import PatientRequest
 import db.db_tinydb as db
-
-from operator import attrgetter
-
-task_date_getter = attrgetter('updated_date')
 
 Task = Query()
 

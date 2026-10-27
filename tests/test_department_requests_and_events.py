@@ -10,6 +10,7 @@ from main import load_all_inputs
 from models import PatientRequest, PatientTask, TaskInput
 from services.patient_department_request_service import (
     DepartmentPatientRequestService, DuplicateOpenRequestError)
+from services.patient_request_service import PerPatientRequestService
 from services.task_event_service import build_task_events
 from services.task_service import TaskService
 
@@ -65,7 +66,8 @@ def test_task_moved_between_departments_is_recorded(manager, inputs):
             ) == ('Radiology', 'Primary')
 
 
-def test_request_that_loses_all_its_tasks_is_closed_and_cleared(manager, inputs):
+def test_request_emptied_by_a_move_is_closed_and_cleared(manager, inputs):
+    """ Its tasks are open in another department, so their data is not copied into the closed request """
     manager.process_tasks_update(inputs[0])
     radiology_id = request_for('patient3', 'Radiology', 'Open')['id']
 
@@ -80,17 +82,82 @@ def test_request_that_loses_all_its_tasks_is_closed_and_cleared(manager, inputs)
         0]['from_request_id'] == radiology_id
 
 
-def test_closing_a_request_clears_its_data(manager, inputs):
+def test_closing_a_request_keeps_the_data_of_the_tasks_closed_in_it(manager, inputs):
+    """ Same as `to_patient_request`: a closed request is medical history """
     manager.process_tasks_update(inputs[0])
+    open_id = request_for('patient1', 'Primary', 'Open')['id']
     manager.process_tasks_update(inputs[1])
 
     closed = request_for('patient1', 'Primary', 'Closed')
 
-    assert closed['messages'] == []
-    assert closed['medications'] == []
+    assert closed['id'] == open_id
     assert set(closed['task_ids']) == {'task1', 'task4'}
+    assert sorted(closed['messages']) == [
+        'Patient needs follow-up appointment', 'Patient needs medication refill']
+    assert {m['code'] for m in closed['medications']
+            } == {'ACET001', 'IBU001', 'LISI001'}
     assert {e['reason'] for e in events_of(patient_id='patient1')} == {
         'created', 'closed'}
+
+
+def test_closing_request_matches_the_closed_request_of_the_per_patient_service(inputs):
+    """ With one department, both services build the same closed request from the same tasks """
+    per_department = ClinicManager(DepartmentPatientRequestService())
+    per_department.process_tasks_update(inputs[0])
+    per_department.process_tasks_update(inputs[1])
+    department_closed = request_for('patient1', 'Primary', 'Closed')
+
+    db.clinic.drop_tables()
+    for table in (db.patient_requests, db.tasks, db.task_events):
+        table.clear_cache()
+    per_patient = ClinicManager(PerPatientRequestService())
+    per_patient.process_tasks_update(inputs[0])
+    per_patient.process_tasks_update(inputs[1])
+    (patient_closed,) = requests_of('patient1', 'Closed')
+
+    for field in ('status', 'assigned_to', 'messages', 'medications', 'task_ids',
+                  'created_date', 'updated_date', 'pharmacy_id'):
+        assert department_closed[field] == patient_closed[field], field
+
+
+def test_data_of_a_task_closed_while_the_request_is_open_is_dropped_from_it(manager):
+    """ README: the data of a closed task is removed from the request that is still open """
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task1', 'patient1', 'Primary', message='first'),
+        task_for('task2', 'patient1', 'Primary', message='second')]))
+
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task1', 'patient1', 'Primary', status='Closed', message='first')]))
+
+    (still_open,) = requests_of('patient1', 'Open')
+    assert set(still_open['task_ids']) == {'task2'}
+    assert still_open['messages'] == ['second']
+
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task2', 'patient1', 'Primary', status='Closed', message='second')]))
+
+    # task1 closed in an earlier update, its data is not in the history of the request
+    (closed,) = requests_of('patient1', 'Closed')
+    assert closed['id'] == still_open['id']
+    assert set(closed['task_ids']) == {'task2'}
+    assert closed['messages'] == ['second']
+
+
+def test_request_with_a_task_closed_and_another_moved_away_keeps_only_the_closed_data(manager):
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task1', 'patient1', 'Primary', message='closes'),
+        task_for('task2', 'patient1', 'Primary', message='moves')]))
+    primary_id = request_for('patient1', 'Primary', 'Open')['id']
+
+    manager.process_tasks_update(TaskInput(tasks=[
+        task_for('task1', 'patient1', 'Primary', status='Closed', message='closes'),
+        task_for('task2', 'patient1', 'Radiology', message='moves')]))
+
+    closed = request_for('patient1', 'Primary', 'Closed')
+    assert closed['id'] == primary_id
+    assert set(closed['task_ids']) == {'task1'}
+    assert closed['messages'] == ['closes']
+    assert request_for('patient1', 'Radiology', 'Open')['messages'] == ['moves']
 
 
 def test_task_closed_and_moved_in_the_same_update(manager, inputs):
@@ -102,10 +169,13 @@ def test_task_closed_and_moved_in_the_same_update(manager, inputs):
     manager.process_tasks_update(inputs[2])
 
     assert requests_of('patient2', 'Open') == []
-    # task5 closes in Primary, so the Dermatology request it left is empty
-    assert not request_for('patient2', 'Dermatology', 'Closed')['task_ids']
-    assert set(request_for('patient2', 'Primary', 'Closed')
-               ['task_ids']) == {'task400', 'task5'}
+    # task5 closes in Primary, so the Dermatology request it left is empty and cleared
+    dermatology = request_for('patient2', 'Dermatology', 'Closed')
+    assert not dermatology['task_ids']
+    assert dermatology['messages'] == [] and dermatology['medications'] == []
+    primary = request_for('patient2', 'Primary', 'Closed')
+    assert set(primary['task_ids']) == {'task400', 'task5'}
+    assert len(primary['messages']) == 2
     (closed,) = events_of(task_id='task5', reason='closed')
     assert closed['from_request_id'] == dermatology_id
     assert closed['from_department'] == 'Dermatology'
@@ -256,12 +326,12 @@ def request_with(request_id, department, task_ids) -> PatientRequest:
         messages=[], pharmacy_id=None, task_ids=task_ids)
 
 
-def task_for(task_id, patient_id, department, status='Open') -> PatientTask:
+def task_for(task_id, patient_id, department, status='Open', message='Moved back') -> PatientTask:
     return PatientTask(
         id=task_id, patient_id=patient_id, status=status, assigned_to=department,
         created_date=datetime(2023, 5, 3, tzinfo=timezone.utc),
         updated_date=datetime(2023, 7, 1, tzinfo=timezone.utc),
-        message='Moved back')
+        message=message)
 
 
 def test_update_logs_stats_summary(manager, inputs, caplog):

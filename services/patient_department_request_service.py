@@ -28,7 +28,8 @@ class DepartmentPatientRequestService(PatientRequestService):
 
     Each update reconciles the touched patients: their tasks are regrouped by department and compared with
     their open requests. A group with open tasks gets its request rebuilt or created, a request without open
-    tasks is closed. A patient has at most one open request per department, and a closed one is never reopened.
+    tasks is closed, keeping the data of the tasks closed in it, or cleared if its tasks all moved away.
+    A patient has at most one open request per department, and a closed one is never reopened.
     """
 
     def __init__(self, task_service: TaskService | None = None,
@@ -124,23 +125,35 @@ class DepartmentPatientRequestService(PatientRequestService):
             return request, action
 
         if existing:
-            self._save(self._close_request(existing, tasks))
+            self._save(self._close_request(patient_id, existing, tasks))
             logger.debug('closed request %s for patient %s, %d tasks closed in it',
                          existing.id, patient_id, len(tasks))
             return None, 'closed'
 
         return None, 'none'
 
-    @staticmethod
-    def _close_request(request: PatientRequest, closed_tasks: list[PatientTask]) -> PatientRequest:
-        """ Closes a request and clears its data. `closed_tasks` are those closed in it by this update,
-        empty if its tasks all moved away. """
+    def _close_request(self, patient_id: str, request: PatientRequest,
+                       closed_tasks: list[PatientTask]) -> PatientRequest:
+        """ Closes the open request of a group that has no open task left. `closed_tasks` are the tasks of the
+        group closed by this update, empty if its tasks all moved away.
+
+        - Tasks closed in it: the closing request is built by `to_patient_request` as it is, so it keeps the data
+          of the tasks closed in it. A closed request is medical history (README). The data of a task closed
+          earlier, while the request was still open, was already dropped by the rebuild (README, "the data of the
+          task needs to be removed").
+        - All its tasks moved away: the data is cleared. Those tasks are open in the request of their new
+          department, so keeping a copy here would duplicate their content under the wrong department.
+          Where they went is in the events. """
+        if closed_tasks:
+            closed = self.to_patient_request(patient_id, closed_tasks)
+            closed.id = request.id
+            return closed
+
         return request.model_copy(update={
             'status': 'Closed',
             'messages': [],
             'medications': [],
-            'task_ids': {t.id for t in closed_tasks},
-            'updated_date': max([request.updated_date, *(t.updated_date for t in closed_tasks)]),
+            'task_ids': set(),
         })
 
     @staticmethod
