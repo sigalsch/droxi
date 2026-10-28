@@ -16,8 +16,9 @@ given patients.
 - `observability.py`, `main.py`: one INFO stats line per update. Log lines carry ids and counts only, never messages,
 medications or departments.
 - Tests: `tests/test_department_requests_and_events.py` is new. The tests now run on TinyDB `MemoryStorage`
-(`tests/conftest.py`), and `__pycache__` and `tinydb/db.json` are no longer tracked.
+(`tests/conftest.py`).
 
+Requires Python 3.12 or newer: the f-string in `db/db_tinydb.py` spans several lines, which is a syntax error on 3.11.
 Run `pytest` from the project root.
 
 ---
@@ -31,7 +32,7 @@ Run `pytest` from the project root.
 ### 2.1 The problem
 
 The old service rebuilds a request from the tasks it receives.
-If grouping is simply changed to`(patient_id, department)`, a move breaks it: a patient's only Dermatology task is reassigned to Primary, the next update has no Dermatology task, so the Dermatology request is never revisited and stays `Open` with stale messages and medications.
+If grouping is simply changed to `(patient_id, department)`, a move breaks it: a patient's only Dermatology task is reassigned to Primary, the next update has no Dermatology task, so the Dermatology request is never revisited and stays `Open` with stale messages and medications.
 Something must close a request whose last task left its department (patient3 goes from 2 open requests to 1 in update 2 of the sample data).
 
 ### 2.2 Decision 1: how to handle a move
@@ -91,8 +92,8 @@ was ever there.
 The events are there for debugging and for clarity in the code: the ordered events of a `task_id` or `patient_id` show what each update did and why a request looks the way it does, instead of working it out from the final state or from logs, and `build_task_events` keeps that bookkeeping in one place, out of the reconcile.
 
 So each task change is written to an append-only `TaskEvents` collection, and the events record the path of each task
-between requests. They are written after the requests and never read by the request flow, so a bug in them cannot corrupt
-a request.
+between requests. They are written after the requests and never read to decide the state of a request (the only read is
+the lookup that skips a replayed `closed` event), so a bug in them cannot corrupt a request.
 
 - **Shape:** one event per changed task, with the reason `created`, `moved` or `closed`, and the request and department before and after. `build_task_events(changed_tasks, open_before, open_after)` compares which open request held each task before and after the update, and a task that stays in the same request produces nothing.
 A task that arrives already closed and was never in an open request gets a `closed` event with no requests.
@@ -144,11 +145,13 @@ are intact.
 - **Department key:** `assigned_to` is used as is. `PatientRequest` has no new field.
 - **Closed request dates:** a request closed with tasks takes `created_date` and `updated_date` from the tasks closed in
 it. A request emptied by a move keeps its old dates.
-- `closed` **events have no** `to_department`**:** a closed task is in no open request.
+- **`closed` events have no `to_department`:** a closed task is in no open request.
 - **One open request per patient and department** is enforced in code: finding two raises `DuplicateOpenRequestError`.
 - **Error handling:** failures are logged with ids, counts and the exception type only, never its message, and are
-re-raised so the caller can retry. There is no transaction, so if only the event write fails, a retry finds no change
-and does not write the missing events, and the task ids are logged for a backfill.
+re-raised so the caller can retry. There is no transaction, so if only the event write fails, the requests are already
+written and a retry cannot rebuild the lost `created` and `moved` events. The retry does write a `closed` event, without
+`from_request_id`, for each task that closed in that update, because no earlier `closed` event exists to mark it as a
+replay. The task ids are logged for a backfill.
 
 ---
 
@@ -156,19 +159,21 @@ and does not write the missing events, and the task ids are logged for a backfil
 
 ## 4. Answers to the questions
 
-- `TaskService.updates_tasks`**:** TinyDB has no bulk upsert, so each task is a separate lookup and write. Without an
+- **`TaskService.updates_tasks`:** TinyDB has no bulk upsert, so each task is a separate lookup and write. Without an
 index on the task id each lookup also scans the whole tasks table (about N x table size). There is no transaction, so
 a failure half way leaves the batch partly applied. MongoDB offers `bulkWrite` with upsert, a unique index on the task
 id for atomic upserts, and multi-document transactions.
-- `ClinicManager`**:** it loaded every open task of every patient on each call, although an update touches dozens of
+- **`ClinicManager`:** it loaded every open task of every patient on each call, although an update touches dozens of
 tasks and only thousands of patients have open requests. The cost grew with the whole backlog instead of the update
 size. The department service now loads only the touched patients' tasks.
-- `PerPatientRequestService`**:** same full scan (kept, to preserve the old behavior). It also runs one query per
+- **`PerPatientRequestService`:** same full scan (kept, to preserve the old behavior). It also runs one query per
 patient to find the open request (N+1) and rewrites every open request even when nothing changed.
 
 **Other observations.** `get_open_tasks` returned a generator that was immediately turned into a list. The type of
 `ClinicManager.__init__`'s argument was `PatientRequestService = None` and should be optional (fixed). The DB path
-`tinydb/db.json` is relative to the working directory.
+`tinydb/db.json` is relative to the working directory. The README says `tests/config.py` can disable the generation of
+the 100 closed requests, but only the test fixtures read `generate_requests`: `init_db()` ignores it, so
+`python main.py` always generates them (left as is).
 
 ---
 

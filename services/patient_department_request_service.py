@@ -62,8 +62,9 @@ class DepartmentPatientRequestService(PatientRequestService):
             # Returns the events written: a replayed update does not duplicate its `closed` events.
             events = self.event_service.record(events)
         except Exception as error:
-            # The requests are already written and a replay produces no events, so the task ids are logged
-            # to allow a backfill. A real DB would write requests and events in one transaction.
+            # The requests are already written, so a retry cannot rebuild the lost `created` and `moved` events
+            # (it only writes `closed` events without a `from_request_id`). The task ids are logged to allow
+            # a backfill. A real DB would write requests and events in one transaction.
             logger.error('failed to record %d task events after updating requests: task_ids=%s error=%s',
                          len(events), [e.task_id for e in events], type(error).__name__)
             raise

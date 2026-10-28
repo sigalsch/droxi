@@ -30,14 +30,16 @@ class ClinicManager:
         started = perf_counter()
         stage = 'storing tasks'
         # The error is logged with its type only, its message may hold task data (PHI rule).
-        # Safe for the caller to retry: storing tasks and updating requests are both idempotent.
+        # Safe for the caller to retry: storing tasks and updating requests are both idempotent. Only the task
+        # events can have gaps, if their write failed (CHANGES.md §3.2).
         try:
             self.task_service.updates_tasks(tasks)
             logger.debug('stored %d tasks in %.1f ms', len(tasks), elapsed_ms(started))
 
             # Question: What is a potential performance issue with this code?
             # Answer: it loaded every open task of every patient on each call, so the cost grew with the whole backlog.
-            # Now only the changed tasks are passed and the service loads the touched patients (CHANGES.md §4).
+            # Now only the changed tasks are passed, and DepartmentPatientRequestService loads just the touched
+            # patients (CHANGES.md §4). PerPatientRequestService, the default, still scans every open task.
             stage = 'updating requests'
             self.patient_request_service.update_requests(tasks)
             logger.debug('tasks update processed in %.1f ms', elapsed_ms(started))

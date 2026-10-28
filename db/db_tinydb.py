@@ -33,7 +33,7 @@ patient_requests = clinic.table('PatientRequest')
 tasks = clinic.table('Tasks')
 # Append-only audit log of task movements between requests
 task_events = clinic.table('TaskEvents')
-# either creates a new database file or accesses an existing one named `my_tiny_database`
+# `clinic` creates the database file tinydb/db.json, or opens it if it exists (in memory under the tests)
 
 
 def init_db():
